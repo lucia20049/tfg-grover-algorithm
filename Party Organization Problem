@@ -1,0 +1,182 @@
+% ── A.1 Imports ───────────────────────────────────────────────────────────────
+
+\lstset{firstnumber=1}
+\begin{lstlisting}[caption={Imports.}]
+import qiskit_aer
+from qiskit import (QuantumCircuit, quantum_info,
+                    QuantumRegister, ClassicalRegister, transpile)
+from qiskit.circuit import Parameter
+from qiskit.circuit.library import MCMT
+from qiskit.visualization import plot_distribution, plot_histogram
+import numpy as np
+import matplotlib.pyplot as plt
+from qiskit_aer import AerSimulator
+from qiskit_ibm_runtime.fake_provider import FakeGuadalupeV2
+from qiskit_ibm_runtime import QiskitRuntimeService
+\end{lstlisting}
+
+% ── A.2 Classical verification ────────────────────────────────────────────────
+
+\begin{lstlisting}[caption={Classical evaluation of $f = ((A \land B) \lor (C \land D)) \land \lnot(A \land D)$.}]
+def classical(a, b, c, d):
+    ab = a and b
+    cd = c and d
+    ad = a and d
+    ab_or_cd = ab or cd
+    f = ab_or_cd and not ad
+    return int(f)
+
+solutions = []
+for a in [0, 1]:
+    for b in [0, 1]:
+        for c in [0, 1]:
+            for d in [0, 1]:
+                if classical(a, b, c, d) == 1:
+                    solutions.append((a, b, c, d))
+print(solutions)
+# Output: [(0,0,1,1), (0,1,1,1), (1,1,0,0), (1,1,1,0)]
+\end{lstlisting}
+
+% ── A.3 Gate definitions ──────────────────────────────────────────────────────
+
+\begin{lstlisting}[caption={OR, AND, and NOT gate definitions.}]
+def OR(qc, a, b, c):
+    # Computes c = a OR b; a and b are restored after the gate.
+    # Uses De Morgan: a OR b = NOT(NOT a AND NOT b)
+    qc.x(a)
+    qc.x(b)
+    qc.ccx(a, b, c)
+    qc.x(a)
+    qc.x(b)
+    qc.x(c)
+    return qc
+
+def AND(qc, a, b, c):
+    qc.mcx([a, b], c)
+    return qc
+
+def NOT(qc, a):
+    qc.x(a)
+    return qc
+\end{lstlisting}
+
+% ── A.4 Party oracle ──────────────────────────────────────────────────────────
+
+\begin{lstlisting}[caption={Party oracle implementing $f$ with compute--mark--uncompute structure.}]
+# Qubit registers (defined globally, reused by Oparty and Grover)
+vq = QuantumRegister(4, name='v')   # variable qubits: A, B, C, D
+cq = QuantumRegister(4, name='c')   # ancilla qubits
+checkqubit = QuantumRegister(1, name='out')  # output qubit
+
+def Oparty(qc):
+    # --- Compute ---
+    qc.ccx(vq[0], vq[1], cq[0])        # cq[0] = A AND B
+    qc.ccx(vq[2], vq[3], cq[1])        # cq[1] = C AND D
+    OR(qc, cq[0], cq[1], cq[2])        # cq[2] = (A AND B) OR (C AND D)
+    qc.ccx(vq[0], vq[3], cq[3])        # cq[3] = A AND D
+    qc.x(cq[3])                         # cq[3] = NOT (A AND D)
+    # --- Mark (phase kickback) ---
+    qc.mcx([cq[2], cq[3]], checkqubit)
+    # --- Uncompute ---
+    qc.x(cq[3])
+    qc.ccx(vq[0], vq[3], cq[3])
+    OR(qc, cq[0], cq[1], cq[2])
+    qc.ccx(vq[2], vq[3], cq[1])
+    qc.ccx(vq[0], vq[1], cq[0])
+    return qc
+\end{lstlisting}
+
+% ── A.5 Diffuser ──────────────────────────────────────────────────────────────
+
+\begin{lstlisting}[caption={Grover diffuser implementing $R = H^{\otimes n} X^{\otimes n}\, MCZ\, X^{\otimes n} H^{\otimes n}$.}]
+def multiZ(qc):
+    # Multi-controlled-Z via H + MCX + H on the last qubit
+    n = qc.num_qubits
+    qc.h(n - 1)
+    qc.mcx(list(range(n - 1)), n - 1)
+    qc.h(n - 1)
+    return qc
+
+def diffuser(n=4):
+    qc = QuantumCircuit(n)
+    for i in range(n):
+        qc.h(i)         # |psi> -> |00..0>
+    for i in range(n):
+        qc.x(i)         # |00..0> -> |11..1>
+    multiZ(qc)          # flip phase of |11..1>
+    for i in range(n):
+        qc.x(i)         # |11..1> -> |00..0>
+    for i in range(n):
+        qc.h(i)         # |00..0> -> |psi>
+    return qc
+\end{lstlisting}
+
+% ── A.6 Grover circuit ────────────────────────────────────────────────────────
+
+\begin{lstlisting}[caption={Full Grover circuit for the party problem with \texttt{ite} iterations.}]
+def Grover(ite=1):
+    vq = QuantumRegister(4, name='v')
+    cq = QuantumRegister(4, name='c')
+    checkqubit = QuantumRegister(1, name='out')
+    cbits = ClassicalRegister(4, name='cbits')
+    qc = QuantumCircuit(vq, cq, checkqubit, cbits)
+
+    # Initialisation: uniform superposition + |-> on output qubit
+    qc.h(vq)
+    qc.x(checkqubit)
+    qc.h(checkqubit)
+    qc.barrier()
+
+    for _ in range(ite):
+        Oparty(qc)            # oracle
+        qc.barrier()
+        qc.append(diffuser(4), vq)  # diffuser
+        qc.barrier()
+
+    qc.measure(vq, cbits)
+    return qc
+\end{lstlisting}
+
+% ── A.7 Simulation function ───────────────────────────────────────────────────
+
+\begin{lstlisting}[caption={Simulation runner using \texttt{FakeGuadalupeV2} as noise model.}]
+def run_fake(qc, device_backend, noise_model=None, Nshots=1024):
+    qc_transpiled = transpile(qc, device_backend)
+    sim_faked = AerSimulator.from_backend(device_backend)
+    if noise_model == True:
+        result = sim_faked.run(qc_transpiled, shots=Nshots).result()
+    else:
+        result = sim_faked.run(qc_transpiled, shots=Nshots,
+                               noise_model=None).result()
+    counts = result.get_counts()
+    return qc_transpiled, counts
+\end{lstlisting}
+
+% ── A.8 Simulations and figure export ─────────────────────────────────────────
+
+\begin{lstlisting}[caption={Ideal simulation for $k=1$ and $k=2$; export to \texttt{party\_iterations.pdf}.}]
+qc1, counts1 = run_fake(Grover(ite=1), FakeGuadalupeV2(), False, Nshots=4096)
+qc2, counts2 = run_fake(Grover(ite=2), FakeGuadalupeV2(), False, Nshots=4096)
+
+fig = plot_distribution(
+    [counts1, counts2],
+    legend=["k=1", "k=2"],
+    color=["#80ED99", "#9D4EDD"],
+    figsize=(12, 5)
+)
+fig.savefig("party_iterations.png", bbox_inches="tight", dpi=150)
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Ideal vs.\ noisy simulation for $k=1$; export to \texttt{party\_noise.pdf}.}]
+qc_ideal, counts_ideal = run_fake(Grover(ite=1), FakeGuadalupeV2(), False,
+                                  Nshots=4096)
+qc_noisy, counts_noisy = run_fake(Grover(ite=1), FakeGuadalupeV2(), True,
+                                  Nshots=4096)
+
+fig = plot_distribution(
+    [counts_ideal, counts_noisy],
+    legend=["Ideal", "Noisy"],
+    color=["#80ED99", "#2B2D42"],
+    figsize=(12, 5)
+)
+fig.savefig("party_noise.png", bbox_inches="tight", dpi=150)
